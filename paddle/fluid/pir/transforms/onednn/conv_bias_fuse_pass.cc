@@ -58,8 +58,7 @@ class ConvBiasFusePattern : public paddle::drr::DrrPatternBase {
 
     pat.Tensor("add_out") = add(pat.Tensor("conv_out"), pat.Tensor("bias"));
 
-    if (conv_name_ == paddle::dialect::Conv2dOp::name() ||
-        conv_name_ == paddle::onednn::dialect::FusedConv2dOp::name()) {
+    if (conv_name_ == paddle::dialect::Conv2dOp::name()) {
       pat.AddConstraint([&](const paddle::drr::MatchContext &match_ctx) {
         if (!pir::ValueIsPersistable(match_ctx.Tensor("bias"))) {
           return false;
@@ -96,7 +95,19 @@ class ConvBiasFusePattern : public paddle::drr::DrrPatternBase {
     }
     pat.AddConstraint([&](const paddle::drr::MatchContext &match_ctx) {
       auto bias_shape = pir::GetShapeFromValue(match_ctx.Tensor("bias"));
-      if (bias_shape.size() != 1) return false;
+      auto output_shape = pir::GetShapeFromValue(match_ctx.Tensor("conv_out"));
+      if (bias_shape.size() != 1) {
+        if (bias_shape[1] != output_shape[1]) return false;
+        bool is_ok = true;
+        for (size_t i = 0; i < bias_shape.size(); i++) {
+          if (i == 1) continue;
+          if (bias_shape[i] != 1) {
+            is_ok = false;
+            break;
+          }
+        }
+        return is_ok;
+      }
       return true;
     });
 
@@ -127,6 +138,137 @@ class ConvBiasFusePattern : public paddle::drr::DrrPatternBase {
                 &res.Tensor("filter"),
                 &res.Tensor("bias"),
                 &res.InputNoneTensor()},
+               {&res.Tensor("add_out")});
+  }
+};
+
+class FusedConvBiasFusePattern : public paddle::drr::DrrPatternBase {
+ private:
+  std::string conv_name_;
+  std::string fused_conv_name_;
+
+ public:
+  FusedConvBiasFusePattern(std::string conv_name, std::string fused_conv_name)
+      : conv_name_(std::move(conv_name)),
+        fused_conv_name_(std::move(fused_conv_name)) {}
+
+  std::string name() const override { return "FusedConvBiasFusePattern"; }
+
+  uint32_t benefit() const override { return 2; }
+
+  void operator()(paddle::drr::DrrPatternContext *ctx) const override {
+    paddle::drr::SourcePattern pat = ctx->SourcePattern();
+
+    const auto &conv = pat.Op(
+        conv_name_,
+        {{
+            {"strides", pat.Attr("strides")},
+            {"paddings", pat.Attr("paddings")},
+            {"padding_algorithm", pat.Attr("padding_algorithm")},
+            {"dilations", pat.Attr("dilations")},
+            {"groups", pat.Attr("groups")},
+            {"data_format", pat.Attr("data_format")},
+            {"mkldnn_data_type", pat.Attr("mkldnn_data_type")},
+            {"fuse_activation", pat.Attr("fuse_activation")},
+            {"fuse_residual_connection", pat.Attr("fuse_residual_connection")},
+            {"force_fp32_output", pat.Attr("force_fp32_output")},
+            {"fuse_alpha", pat.Attr("fuse_alpha")},
+            {"fuse_beta", pat.Attr("fuse_beta")},
+            {"scale_in", pat.Attr("scale_in")},
+            {"scale_out", pat.Attr("scale_out")},
+            {"scale_in_eltwise", pat.Attr("scale_in_eltwise")},
+            {"scale_weights", pat.Attr("scale_weights")},
+        }});
+
+    const auto &add = pat.Op(paddle::dialect::AddOp::name());
+    conv({&pat.Tensor("input"),
+          &pat.Tensor("filter"),
+          &pat.InputNoneTensor(),
+          &pat.Tensor("residual")},
+         {&pat.Tensor("conv_out")});
+
+    pat.Tensor("add_out") = add(pat.Tensor("conv_out"), pat.Tensor("bias"));
+
+    if (conv_name_ == paddle::onednn::dialect::FusedConv2dOp::name()) {
+      pat.AddConstraint([&](const paddle::drr::MatchContext &match_ctx) {
+        if (!pir::ValueIsPersistable(match_ctx.Tensor("bias"))) {
+          return false;
+        }
+
+        std::set<std::string> padding_algorithm = {"EXPLICIT", "SAME", "VALID"};
+        std::set<std::string> data_format = {"NCHW", "NHWC", "AnyLayout"};
+        if (padding_algorithm.count(
+                match_ctx.Attr<std::string>("padding_algorithm")) == 0 ||
+            data_format.count(match_ctx.Attr<std::string>("data_format")) ==
+                0 ||
+            match_ctx.Attr<int>("groups") < 1) {
+          return false;
+        }
+        return true;
+      });
+    } else {
+      pat.AddConstraint([&](const paddle::drr::MatchContext &match_ctx) {
+        if (!pir::ValueIsPersistable(match_ctx.Tensor("bias"))) {
+          return false;
+        }
+
+        std::set<std::string> padding_algorithm = {"EXPLICIT", "SAME", "VALID"};
+        std::set<std::string> data_format = {"NDHWC", "NCDHW"};
+        if (padding_algorithm.count(
+                match_ctx.Attr<std::string>("padding_algorithm")) == 0 ||
+            data_format.count(match_ctx.Attr<std::string>("data_format")) ==
+                0 ||
+            match_ctx.Attr<int>("groups") < 1) {
+          return false;
+        }
+        return true;
+      });
+    }
+
+    pat.AddConstraint([&](const paddle::drr::MatchContext &match_ctx) {
+      auto bias_shape = pir::GetShapeFromValue(match_ctx.Tensor("bias"));
+      auto output_shape = pir::GetShapeFromValue(match_ctx.Tensor("conv_out"));
+      if (bias_shape.size() != 1) {
+        if (bias_shape[1] != output_shape[1]) return false;
+        bool is_ok = true;
+        for (size_t i = 0; i < bias_shape.size(); i++) {
+          if (i == 1) continue;
+          if (bias_shape[i] != 1) {
+            is_ok = false;
+            break;
+          }
+        }
+        return is_ok;
+      }
+      return true;
+    });
+
+    paddle::drr::ResultPattern res = pat.ResultPattern();
+    const auto &fused_conv = res.Op(
+        fused_conv_name_,
+        {{
+            {"strides", pat.Attr("strides")},
+            {"paddings", pat.Attr("paddings")},
+            {"padding_algorithm", pat.Attr("padding_algorithm")},
+            {"dilations", pat.Attr("dilations")},
+            {"groups", pat.Attr("groups")},
+            {"data_format", pat.Attr("data_format")},
+            {"mkldnn_data_type", pat.Attr("mkldnn_data_type")},
+            {"fuse_activation", pat.Attr("fuse_activation")},
+            {"fuse_residual_connection", pat.Attr("fuse_residual_connection")},
+            {"force_fp32_output", pat.Attr("force_fp32_output")},
+            {"fuse_alpha", pat.Attr("fuse_alpha")},
+            {"fuse_beta", pat.Attr("fuse_beta")},
+            {"scale_in", pat.Attr("scale_in")},
+            {"scale_out", pat.Attr("scale_out")},
+            {"scale_in_eltwise", pat.Attr("scale_in_eltwise")},
+            {"scale_weights", pat.Attr("scale_weights")},
+        }});
+
+    fused_conv({&res.Tensor("input"),
+                &res.Tensor("filter"),
+                &res.Tensor("bias"),
+                &res.Tensor("residual")},
                {&res.Tensor("add_out")});
   }
 };
@@ -312,6 +454,10 @@ class Conv2dBiasFusePass : public pir::PatternRewritePass {
         context,
         paddle::dialect::Conv2dOp::name(),
         paddle::onednn::dialect::FusedConv2dOp::name()));
+    ps.Add(paddle::drr::Create<FusedConvBiasFusePattern>(
+        context,
+        paddle::onednn::dialect::FusedConv2dOp::name(),
+        paddle::onednn::dialect::FusedConv2dOp::name()));
     return ps;
   }
 };
@@ -338,6 +484,10 @@ class Conv3dBiasFusePass : public pir::PatternRewritePass {
     ps.Add(paddle::drr::Create<ConvBiasFusePattern>(
         context,
         paddle::dialect::Conv3dOp::name(),
+        paddle::onednn::dialect::FusedConv3dOp::name()));
+    ps.Add(paddle::drr::Create<FusedConvBiasFusePattern>(
+        context,
+        paddle::onednn::dialect::FusedConv3dOp::name(),
         paddle::onednn::dialect::FusedConv3dOp::name()));
     return ps;
   }

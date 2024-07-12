@@ -124,13 +124,6 @@ class ConvOneDNNHandlerT
                 "The Bias tensor's layout should be %d, but got %d.",
                 DataLayout::ONEDNN,
                 bias->layout()));
-
-        PADDLE_ENFORCE_EQ(
-            bias->dims().size(),
-            1,
-            phi::errors::InvalidArgument("Bias must only have 1 dimension, "
-                                         "i.e. X, but got dimension = %d .",
-                                         bias->dims().size()));
       }
       const auto input_dims = input->dims();
       const auto data_dims =

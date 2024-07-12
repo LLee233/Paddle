@@ -93,27 +93,63 @@ void ComputeFP32(const OneDNNContext& dev_ctx,
   const bool is_conv3d = strides.size() == 3U;
   const std::string& unique_name =
       dev_ctx.GetInputsName("Input")[0] + dev_ctx.GetInputsName("Filter")[0];
+  phi::DenseTensor new_bias;
+  if (bias) {
+    new_bias = *bias;
+    auto bias_shape = common::vectorize(bias->dims());
+    auto output_shape = common::vectorize(output->dims());
+    if (bias_shape.size() != 1) {
+      PADDLE_ENFORCE_EQ(
+          bias_shape[1],
+          output_shape[1],
+          phi::errors::InvalidArgument(
+              "Bias must only have 1 dimension or only bias_dims[1] == "
+              "output_dims[1] i.e. [X] or [1, X, 1, 1], but got dimension "
+              "== %d and failed",
+              bias->dims().size()));
+      for (size_t i = 0; i < bias_shape.size(); i++) {
+        if (i == 1) continue;
+        PADDLE_ENFORCE_EQ(
+            bias_shape[i],
+            1,
+            phi::errors::InvalidArgument(
+                "Bias with multiply dimensions must only have 1 dimension "
+                "> 1, i.e. [1, X, 1, 1], but got %d-th dimension == %d .",
+                i,
+                bias_shape[i]));
+      }
+      common::DDim new_shape = common::flatten_to_1d(bias->dims());
+      VLOG(0) << "new shape: " << new_shape.size();
+      new_bias = new_bias.Resize(new_shape);
+      dnnl::memory::desc bias_md =
+          funcs::OneDNNMemDesc(common::vectorize(new_shape),
+                               dnnl::memory::data_type::f32,
+                               funcs::OneDNNMemoryFormat::x);
+      new_bias.set_mem_desc(bias_md);
+    }
+  }
   PD_VISIT_FLOAT_AND_INT8_TYPES(
       filter->dtype(), "ConvOneDNNHandlerT", ([&] {
-        onednn::ConvOneDNNHandlerT<T, data_t, T_out> handler(dev_ctx,
-                                                             onednn_engine,
-                                                             dev_ctx.GetPlace(),
-                                                             input,
-                                                             filter,
-                                                             bias,
-                                                             strides,
-                                                             paddings,
-                                                             padding_algorithm,
-                                                             dilations,
-                                                             groups,
-                                                             data_format,
-                                                             is_test,
-                                                             is_BFLOAT16,
-                                                             fuse_activation,
-                                                             fuse_residual_conn,
-                                                             force_fp32_output,
-                                                             output,
-                                                             unique_name);
+        onednn::ConvOneDNNHandlerT<T, data_t, T_out> handler(
+            dev_ctx,
+            onednn_engine,
+            dev_ctx.GetPlace(),
+            input,
+            filter,
+            bias ? &new_bias : nullptr,
+            strides,
+            paddings,
+            padding_algorithm,
+            dilations,
+            groups,
+            data_format,
+            is_test,
+            is_BFLOAT16,
+            fuse_activation,
+            fuse_residual_conn,
+            force_fp32_output,
+            output,
+            unique_name);
         auto src_memory_p = handler.AcquireSrcMemoryWithReorder(input);
         auto weights_memory_p = handler.AcquireWeightsMemoryWithReorder(
             filter, groups, is_conv3d, is_test);
@@ -133,7 +169,7 @@ void ComputeFP32(const OneDNNContext& dev_ctx,
 
         if (bias) {
           auto bias_memory_p =
-              handler.AcquireBiasMemoryWithReorder(bias, is_test);
+              handler.AcquireBiasMemoryWithReorder(&new_bias, is_test);
           args.insert({DNNL_ARG_BIAS, *bias_memory_p});
         }
 
